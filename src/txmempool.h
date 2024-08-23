@@ -816,6 +816,46 @@ public:
         assert(m_epoch.guarded()); // verify guard even when it==nullopt
         return !it || visited(*it);
     }
+
+    class ChangeSet {
+    public:
+        explicit ChangeSet(CTxMemPool* pool) : m_pool(pool) {}
+        ~ChangeSet() = default;
+
+        ChangeSet(const ChangeSet&) = delete;
+        ChangeSet& operator=(const ChangeSet&) = delete;
+
+        using TxHandle = CTxMemPool::txiter;
+
+        TxHandle StageAddition(const CTransactionRef& tx, const CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp);
+        void StageRemoval(CTxMemPool::txiter it) { m_to_remove.insert(it); }
+
+        util::Result<CTxMemPool::setEntries> CalculateMemPoolAncestors(TxHandle tx, const Limits& limits)
+        {
+            // Look up transaction in our cache first
+            auto it = m_ancestors.find(tx);
+            if (it != m_ancestors.end()) return it->second;
+
+            // If not found, try to have the mempool calculate it, and cache
+            // for later.
+            LOCK(m_pool->cs);
+            auto ret{m_pool->CalculateMemPoolAncestors(*tx, limits)};
+            if (ret) m_ancestors.try_emplace(tx, *ret);
+            return ret;
+        }
+
+        void Apply() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    private:
+        CTxMemPool* m_pool;
+        CTxMemPool::indexed_transaction_set m_to_add;
+        std::vector<CTxMemPool::txiter> m_entry_vec; // track the added transactions' insertion order
+        // map from the m_to_add index to the ancestors for the transaction
+        std::map<CTxMemPool::txiter, CTxMemPool::setEntries, CompareIteratorByHash> m_ancestors;
+        CTxMemPool::setEntries m_to_remove;
+    };
+
+    std::unique_ptr<ChangeSet> GetChangeSet() EXCLUSIVE_LOCKS_REQUIRED(cs) { return std::make_unique<ChangeSet>(this); }
 };
 
 /**
