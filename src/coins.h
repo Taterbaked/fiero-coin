@@ -110,7 +110,7 @@ struct CCoinsCacheEntry
 private:
     /**
      * These are used to create a doubly linked list of flagged entries.
-     * They are set in AddFlags and unset in ClearFlags.
+     * They are set in SetDirty, SetFresh, and unset in SetClean.
      * A flagged entry is any entry that is either DIRTY, FRESH, or both.
      *
      * DIRTY entries are tracked so that only modified entries can be passed to
@@ -156,7 +156,7 @@ public:
     explicit CCoinsCacheEntry(Coin&& coin_) noexcept : coin(std::move(coin_)) {}
     ~CCoinsCacheEntry()
     {
-        ClearFlags();
+        SetClean();
     }
 
     //! Adding a flag also requires a self reference to the pair that contains
@@ -164,8 +164,9 @@ public:
     //! flagged pair linked list.
     inline void AddFlags(uint8_t flags, CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
     {
+        Assume(flags & (DIRTY | FRESH));
         Assume(&self.second == this);
-        if (!m_flags && flags) {
+        if (!m_flags) {
             m_prev = sentinel.second.m_prev;
             m_next = &sentinel;
             sentinel.second.m_prev = &self;
@@ -173,7 +174,15 @@ public:
         }
         m_flags |= flags;
     }
-    inline void ClearFlags() noexcept
+    inline void SetDirty(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
+    {
+        AddFlags(DIRTY, self, sentinel);
+    }
+    inline void SetFresh(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
+    {
+        AddFlags(FRESH, self, sentinel);
+    }
+    inline void SetClean() noexcept
     {
         if (!m_flags) return;
         m_next->second.m_prev = m_prev;
@@ -279,13 +288,13 @@ struct CoinsViewCacheCursor
     {
         const auto next_entry{current.second.Next()};
         // If we are not going to erase the cache, we must still erase spent entries.
-        // Otherwise clear the flags on the entry.
+        // Otherwise, clear the state of the entry.
         if (!m_will_erase) {
             if (current.second.coin.IsSpent()) {
                 m_usage -= current.second.coin.DynamicMemoryUsage();
                 m_map.erase(current.first);
             } else {
-                current.second.ClearFlags();
+                current.second.SetClean();
             }
         }
         return next_entry;
