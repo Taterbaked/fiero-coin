@@ -57,6 +57,13 @@ public:
     uint64_t m_k0, m_k1;
 
     /**
+    * Set of transactions to be added to the reconciliation set on the next trickle. These are still unrequestable for
+    * privacy reasons (to prevent transaction probing), transactions became available (moved to m_local_set) once they
+    * would have been announced via fanout.
+    */
+    std::unordered_set<Wtxid, SaltedTxidHasher> m_delayed_local_set;
+
+    /**
      * Store all wtxids which we would announce to the peer (policy checks passed, etc.)
      * in this set instead of announcing them right away. When reconciliation time comes, we will
      * compute a compressed representation of this set ("sketch") and use it to efficiently
@@ -74,7 +81,37 @@ public:
      */
     std::map<uint32_t, Wtxid> m_short_id_mapping;
 
-    TxReconciliationState(bool we_initiate, uint64_t k0, uint64_t k1) : m_we_initiate(we_initiate), m_k0(k0), m_k1(k1) {}
+    TxReconciliationState(bool we_initiate, uint64_t k0, uint64_t k1) : m_we_initiate(we_initiate), m_k0(k0), m_k1(k1), m_delayed_local_set(), m_local_set(0, m_delayed_local_set.hash_function()) {}
+
+    /**
+    * Checks whether a transaction is already in the set. If `include_delayed` is set, the delayed set is also
+    * checked. Otherwise, transactions are only looked up in the regular set.
+    */
+    bool ContainsTx(const Wtxid& wtxid, bool include_delayed)
+    {
+        bool found = m_local_set.find(wtxid) != m_local_set.end();
+        if (include_delayed) {
+            found |= m_delayed_local_set.find(wtxid) != m_delayed_local_set.end();
+        }
+
+        return found;
+    }
+
+    /**
+     * Computes the size of the reconciliation set (including both available and delayed transactions)
+     */
+    size_t ReconSetSize()
+    {
+        return m_local_set.size() + m_delayed_local_set.size();
+    }
+
+    bool RemoveFromSet(const Wtxid& wtxid)
+    {
+        auto r = m_local_set.erase(wtxid) + m_delayed_local_set.erase(wtxid);
+        // Data must be in one of the sets at most
+        Assume(r <= 1);
+        return r;
+    }
 
     /**
      * Reconciliation sketches are computed over short transaction IDs.
@@ -212,7 +249,7 @@ public:
         if (!peer_state) return AddToSetResult::Failed();
 
         // Bypass if the wtxid is already in the set
-        if (peer_state->m_local_set.find(wtxid) != peer_state->m_local_set.end()) {
+        if (peer_state->ContainsTx(wtxid, /*include_delayed=*/true)) {
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "%s already in reconciliation set for peer=%d. Bypassing.\n",
                           wtxid.ToString(), peer_id);
             return AddToSetResult::Succeeded();
@@ -237,18 +274,42 @@ public:
         // However, exploiting (2) should not prevent us from relaying certain transactions.
         //
         // Transactions which don't make it to the set due to the limit are announced via fan-out.
-        if (peer_state->m_local_set.size() >= MAX_RECONSET_SIZE) return AddToSetResult::Failed();
+        auto set_size = peer_state->ReconSetSize();
+        if (set_size >= MAX_RECONSET_SIZE) return AddToSetResult::Failed();
 
         // The caller currently keeps track of the per-peer transaction announcements, so it
         // should not attempt to add same tx to the set twice. However, if that happens, we will
         // simply ignore it.
-        if (peer_state->m_local_set.insert(wtxid).second) {
+        if (peer_state->m_delayed_local_set.insert(wtxid).second) {
             peer_state->m_short_id_mapping.emplace(short_id, wtxid);
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Added %s to the reconciliation set for peer=%d. "
                                                                         "Now the set contains %i transactions.\n",
-                          wtxid.ToString(), peer_id, peer_state->m_local_set.size());
+                          wtxid.ToString(), peer_id, set_size + 1);
         }
         return AddToSetResult::Succeeded();
+    }
+
+    bool ReadyDelayedTransactions(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        peer_state->m_local_set.merge(peer_state->m_delayed_local_set);
+        // There should be no duplicates, so m_delayed_local_set should be emptied
+        Assert(peer_state->m_delayed_local_set.empty());
+        return true;
+    }
+
+    bool IsTransactionInSet(NodeId peer_id, const Wtxid& wtxid, bool include_delayed) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        return peer_state->ContainsTx(wtxid, include_delayed);
     }
 
     bool TryRemovingFromSet(NodeId peer_id, const Wtxid& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
@@ -258,12 +319,12 @@ public:
         auto peer_state = GetRegisteredPeerState(peer_id);
         if (!peer_state) return false;
 
-        auto removed = peer_state->m_local_set.erase(wtxid) > 0;
+        auto removed = peer_state->RemoveFromSet(wtxid);
         if (removed) {
             peer_state->m_short_id_mapping.erase(peer_state->ComputeShortID(wtxid));
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Removed %s from the reconciliation set for peer=%d. "
                                                                         "Now the set contains %i transactions.\n",
-                          wtxid.ToString(), peer_id, peer_state->m_local_set.size());
+                          wtxid.ToString(), peer_id, peer_state->ReconSetSize());
         } else {
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Couldn't remove %s from the reconciliation set for peer=%d. "
                                                                         "Transaction not found\n",
@@ -391,9 +452,9 @@ public:
 
 
         for (auto &[parent_count, peer_id]: parents_by_peer) {
-            const auto state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);
+            auto state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);
             for (const auto& wtxid: parents) {
-                if (auto found = state.m_local_set.find(wtxid); found != state.m_local_set.end()) {
+                if (state.ContainsTx(wtxid, /*include_delayed=*/true)) {
                     ++parent_count;
                 }
             }
@@ -460,6 +521,16 @@ bool TxReconciliationTracker::HasCollision(NodeId peer_id, const Wtxid& wtxid, W
 AddToSetResult TxReconciliationTracker::AddToSet(NodeId peer_id, const Wtxid& wtxid)
 {
     return m_impl->AddToSet(peer_id, wtxid);
+}
+
+bool TxReconciliationTracker::ReadyDelayedTransactions(NodeId peer_id)
+{
+    return m_impl->ReadyDelayedTransactions(peer_id);
+}
+
+bool TxReconciliationTracker::IsTransactionInSet(NodeId peer_id, const Wtxid& wtxid, bool include_delayed)
+{
+    return m_impl->IsTransactionInSet(peer_id, wtxid, include_delayed);
 }
 
 bool TxReconciliationTracker::TryRemovingFromSet(NodeId peer_id, const Wtxid& wtxid)
