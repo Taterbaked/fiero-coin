@@ -684,7 +684,7 @@ UniValue MempoolInfoToJSON(const CTxMemPool& pool)
     ret.pushKV("unbroadcastcount", uint64_t{pool.GetUnbroadcastTxs().size()});
     ret.pushKV("fullrbf", pool.m_opts.full_rbf);
     ret.pushKV("permitbaremultisig", pool.m_opts.permit_bare_multisig);
-    ret.pushKV("maxdatacarriersize", (pool.m_opts.max_datacarrier_bytes ? *pool.m_opts.max_datacarrier_bytes : 0));
+    ret.pushKV("maxdatacarriersize", pool.m_opts.max_datacarrier_bytes.value_or(0));
     return ret;
 }
 
