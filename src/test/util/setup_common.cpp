@@ -141,7 +141,7 @@ BasicTestingSetup::BasicTestingSetup(const ChainType chainType, TestOpts opts)
     const std::string test_name{G_TEST_GET_FULL_NAME ? G_TEST_GET_FULL_NAME() : ""};
     if (!m_node.args->IsArgSet("-testdatadir")) {
         // By default, the data directory has a random name on each test run
-        const auto rand_str{g_rng_temp_path.rand256().ToString()};
+        const auto rand_str{util::ToString(g_rng_temp_path.rand32())};
         m_path_root = fs::temp_directory_path() / TEST_DIR_PATH_ELEMENT / test_name / rand_str;
         TryCreateDirectories(m_path_root);
     } else {
