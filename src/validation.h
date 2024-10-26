@@ -31,6 +31,7 @@
 #include <util/fs.h>
 #include <util/hasher.h>
 #include <util/result.h>
+#include <util/threadpool.h>
 #include <util/translation.h>
 #include <versionbits.h>
 
@@ -946,6 +947,7 @@ private:
         return cs && !cs->m_disabled;
     }
 
+    std::shared_ptr<ThreadPool> m_thread_pool;
     //! A queue for script verifications that have to be performed by worker threads.
     CCheckQueue<CScriptCheck> m_script_check_queue;
 

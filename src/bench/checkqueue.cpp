@@ -8,6 +8,7 @@
 #include <key.h>
 #include <prevector.h>
 #include <random.h>
+#include <util/threadpool.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +44,9 @@ static void CCheckQueueSpeedPrevectorJob(benchmark::Bench& bench)
     // The main thread should be counted to prevent thread oversubscription, and
     // to decrease the variance of benchmark results.
     int worker_threads_num{GetNumCores() - 1};
-    CCheckQueue<PrevectorJob> queue{QUEUE_BATCH_SIZE, worker_threads_num};
+    auto thread_pool{std::make_shared<ThreadPool>()};
+    thread_pool->Start(worker_threads_num);
+    CCheckQueue<PrevectorJob> queue{QUEUE_BATCH_SIZE, thread_pool};
 
     // create all the data once, then submit copies in the benchmark.
     FastRandomContext insecure_rand(true);

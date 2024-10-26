@@ -6,6 +6,7 @@
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
+#include <util/threadpool.h>
 
 #include <cstdint>
 #include <string>
@@ -31,8 +32,12 @@ FUZZ_TARGET(checkqueue)
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
 
     const unsigned int batch_size = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 1024);
-    CCheckQueue<DumbCheck> check_queue_1{batch_size, /*worker_threads_num=*/0};
-    CCheckQueue<DumbCheck> check_queue_2{batch_size, /*worker_threads_num=*/0};
+    auto thread_pool_1{std::make_shared<ThreadPool>()};
+    thread_pool_1->Start(0);
+    auto thread_pool_2{std::make_shared<ThreadPool>()};
+    thread_pool_2->Start(0);
+    CCheckQueue<DumbCheck> check_queue_1{batch_size, thread_pool_1};
+    CCheckQueue<DumbCheck> check_queue_2{batch_size, thread_pool_2};
     std::vector<DumbCheck> checks_1;
     std::vector<DumbCheck> checks_2;
     const int size = fuzzed_data_provider.ConsumeIntegralInRange<int>(0, 1024);

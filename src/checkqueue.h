@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2022 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,8 +6,7 @@
 #define BITCOIN_CHECKQUEUE_H
 
 #include <sync.h>
-#include <tinyformat.h>
-#include <util/threadnames.h>
+#include <util/threadpool.h>
 
 #include <algorithm>
 #include <iterator>
@@ -27,99 +26,42 @@ template <typename T>
 class CCheckQueue
 {
 private:
-    //! Mutex to protect the inner state
-    Mutex m_mutex;
-
-    //! Worker threads block on this when out of work
-    std::condition_variable m_worker_cv;
-
-    //! Master thread blocks on this when out of work
-    std::condition_variable m_master_cv;
-
-    //! The queue of elements to be processed.
-    //! As the order of booleans doesn't matter, it is used as a LIFO (stack)
-    std::vector<T> queue GUARDED_BY(m_mutex);
-
-    //! The number of workers (including the master) that are idle.
-    int nIdle GUARDED_BY(m_mutex){0};
-
-    //! The total number of workers (including the master).
-    int nTotal GUARDED_BY(m_mutex){0};
-
     //! The temporary evaluation result.
-    bool fAllOk GUARDED_BY(m_mutex){true};
-
-    /**
-     * Number of verifications that haven't completed yet.
-     * This includes elements that are no longer queued, but still in the
-     * worker's own batches.
-     */
-    unsigned int nTodo GUARDED_BY(m_mutex){0};
+    std::atomic<bool> m_all_ok{true};
 
     //! The maximum number of elements to be processed in one batch
     const unsigned int nBatchSize;
+    std::shared_ptr<ThreadPool> m_thread_pool;
 
-    std::vector<std::thread> m_worker_threads;
-    bool m_request_stop GUARDED_BY(m_mutex){false};
-
-    /** Internal function that does bulk of the verification work. */
-    bool Loop(bool fMaster) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    void Check(std::vector<T>&& checks) noexcept
     {
-        std::condition_variable& cond = fMaster ? m_master_cv : m_worker_cv;
-        std::vector<T> vChecks;
-        vChecks.reserve(nBatchSize);
-        unsigned int nNow = 0;
-        bool fOk = true;
-        do {
-            {
-                WAIT_LOCK(m_mutex, lock);
-                // first do the clean-up of the previous loop run (allowing us to do it in the same critsect)
-                if (nNow) {
-                    fAllOk &= fOk;
-                    nTodo -= nNow;
-                    if (nTodo == 0 && !fMaster)
-                        // We processed the last element; inform the master it can exit and return the result
-                        m_master_cv.notify_one();
-                } else {
-                    // first iteration
-                    nTotal++;
-                }
-                // logically, the do loop starts here
-                while (queue.empty() && !m_request_stop) {
-                    if (fMaster && nTodo == 0) {
-                        nTotal--;
-                        bool fRet = fAllOk;
-                        // reset the status for new work later
-                        fAllOk = true;
-                        // return the current status
-                        return fRet;
-                    }
-                    nIdle++;
-                    cond.wait(lock); // wait
-                    nIdle--;
-                }
-                if (m_request_stop) {
-                    return false;
-                }
+        bool ok{m_all_ok};
+        if (!ok) return;
+        for  (T& check : checks)
+            if (ok)
+                ok = check();
+        if (!ok) m_all_ok = false;
+    }
 
-                // Decide how many work units to process now.
-                // * Do not try to do everything at once, but aim for increasingly smaller batches so
-                //   all workers finish approximately simultaneously.
-                // * Try to account for idle jobs which will instantly start helping.
-                // * Don't do batches smaller than 1 (duh), or larger than nBatchSize.
-                nNow = std::max(1U, std::min(nBatchSize, (unsigned int)queue.size() / (nTotal + nIdle + 1)));
-                auto start_it = queue.end() - nNow;
-                vChecks.assign(std::make_move_iterator(start_it), std::make_move_iterator(queue.end()));
-                queue.erase(start_it, queue.end());
-                // Check whether we need to do work at all
-                fOk = fAllOk;
+    void CheckBatch(std::vector<T>&& checks) noexcept
+    {
+        const uint32_t batch_size = std::max(1U, std::min(nBatchSize, static_cast<uint32_t>(checks.size() / (m_thread_pool->WorkersCount() + 1))));
+        uint32_t i{0};
+        std::vector<T> local_checks{};
+        local_checks.reserve(batch_size);
+        for (auto it{checks.begin()}; it != checks.end(); ++i, ++it) {
+            local_checks.emplace_back(std::move(*it));
+            if (i == batch_size || std::next(it) == checks.end()) {
+                m_thread_pool->Submit([this, checks = std::move(local_checks)]() mutable {
+                    Check(std::move(checks));
+                });
+                i = 0;
+                local_checks = std::vector<T>{};
+                if (std::next(it) != checks.end()) {
+                    local_checks.reserve(batch_size);
+                }
             }
-            // execute work
-            for (T& check : vChecks)
-                if (fOk)
-                    fOk = check();
-            vChecks.clear();
-        } while (true);
+        }
     }
 
 public:
@@ -127,61 +69,34 @@ public:
     Mutex m_control_mutex;
 
     //! Create a new check queue
-    explicit CCheckQueue(unsigned int batch_size, int worker_threads_num)
-        : nBatchSize(batch_size)
+    explicit CCheckQueue(unsigned int batch_size, std::shared_ptr<ThreadPool> thread_pool)
+        : nBatchSize(batch_size), m_thread_pool(thread_pool)
     {
-        m_worker_threads.reserve(worker_threads_num);
-        for (int n = 0; n < worker_threads_num; ++n) {
-            m_worker_threads.emplace_back([this, n]() {
-                util::ThreadRename(strprintf("scriptch.%i", n));
-                Loop(false /* worker thread */);
-            });
-        }
     }
 
-    // Since this class manages its own resources, which is a thread
-    // pool `m_worker_threads`, copy and move operations are not appropriate.
-    CCheckQueue(const CCheckQueue&) = delete;
-    CCheckQueue& operator=(const CCheckQueue&) = delete;
-    CCheckQueue(CCheckQueue&&) = delete;
-    CCheckQueue& operator=(CCheckQueue&&) = delete;
-
     //! Wait until execution finishes, and return whether all evaluations were successful.
-    bool Wait() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    bool Wait()
     {
-        return Loop(true /* master thread */);
+        while (m_thread_pool->ProcessTask()) {}
+        m_thread_pool->WaitUntilIdle();
+        const bool ret{m_all_ok};
+        m_all_ok = true;
+        return ret;
     }
 
     //! Add a batch of checks to the queue
-    void Add(std::vector<T>&& vChecks) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    void Add(std::vector<T>&& checks) noexcept
     {
-        if (vChecks.empty()) {
+        if (!m_all_ok || checks.empty()) {
             return;
         }
 
-        {
-            LOCK(m_mutex);
-            queue.insert(queue.end(), std::make_move_iterator(vChecks.begin()), std::make_move_iterator(vChecks.end()));
-            nTodo += vChecks.size();
-        }
-
-        if (vChecks.size() == 1) {
-            m_worker_cv.notify_one();
-        } else {
-            m_worker_cv.notify_all();
-        }
+        m_thread_pool->Submit([this, checks = std::move(checks)]() mutable {
+            CheckBatch(std::move(checks));
+        });
     }
 
-    ~CCheckQueue()
-    {
-        WITH_LOCK(m_mutex, m_request_stop = true);
-        m_worker_cv.notify_all();
-        for (std::thread& t : m_worker_threads) {
-            t.join();
-        }
-    }
-
-    bool HasThreads() const { return !m_worker_threads.empty(); }
+    bool HasThreads() const noexcept { return m_thread_pool->WorkersCount() > 0; }
 };
 
 /**
