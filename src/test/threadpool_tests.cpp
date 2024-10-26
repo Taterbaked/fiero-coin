@@ -62,7 +62,7 @@ BOOST_AUTO_TEST_CASE(threadpool_basic)
                 counter++;
             });
         }
-        while (threadPool.WorkQueueSize() != 0) {
+        while (threadPool.WorkQueueSize() > 0 || threadPool.InFlightTasksCount() > NUM_WORKERS_DEFAULT - 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
         }
         BOOST_CHECK_EQUAL(counter, num_tasks);
@@ -151,9 +151,7 @@ BOOST_AUTO_TEST_CASE(threadpool_basic)
         BOOST_CHECK_EQUAL(threadPool.WorkQueueSize(), 20);
 
         // Now process them manually
-        for (int i=0; i<num_tasks; i++) {
-            threadPool.ProcessTask();
-        }
+        while (threadPool.ProcessTask()) {}
         BOOST_CHECK_EQUAL(counter, num_tasks);
         stop = true;
         threadPool.Stop();

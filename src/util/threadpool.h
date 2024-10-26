@@ -28,16 +28,23 @@ class ThreadPool {
 private:
     Mutex cs_work_queue;
     std::queue<std::function<void()>> m_work_queue GUARDED_BY(cs_work_queue);
+    std::condition_variable m_wait_condition;
     std::condition_variable m_condition;
     CThreadInterrupt m_interrupt;
     std::vector<std::thread> m_workers;
+    int32_t m_in_flight_task_count GUARDED_BY(cs_work_queue){0};
 
     void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
     {
+        bool did_first_run{false};
         WAIT_LOCK(cs_work_queue, wait_lock);
         while (!m_interrupt) {
             std::function<void()> task;
             {
+                if (did_first_run) {
+                    --m_in_flight_task_count;
+                    m_wait_condition.notify_all();
+                }
                 // Wait for the task or until the stop flag is set
                 m_condition.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(cs_work_queue) { return m_interrupt || !m_work_queue.empty(); });
 
@@ -49,6 +56,8 @@ private:
                 // Pop the task
                 task = std::move(m_work_queue.front());
                 m_work_queue.pop();
+                ++m_in_flight_task_count;
+                did_first_run = true;
             }
 
             // Execute the task without the lock
@@ -78,6 +87,7 @@ public:
     {
         // Notify workers and join them.
         m_interrupt();
+        m_wait_condition.notify_all();
         m_condition.notify_all();
         for (auto& worker : m_workers) {
             worker.join();
@@ -102,23 +112,50 @@ public:
     }
 
     // Synchronous processing
-    void ProcessTask() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    bool ProcessTask() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
     {
         std::function<void()> task;
         {
             LOCK(cs_work_queue);
-            if (m_work_queue.empty()) return;
+            if (m_work_queue.empty()) return false;
 
             // Pop the task
             task = std::move(m_work_queue.front());
             m_work_queue.pop();
         }
         task();
+        return true;
     }
 
     size_t WorkQueueSize() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
     {
         return WITH_LOCK(cs_work_queue, return m_work_queue.size());
+    }
+
+    size_t InFlightTasksCount() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    {
+        return WITH_LOCK(cs_work_queue, return m_in_flight_task_count);
+    }
+
+    bool IsIdle() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    {
+        return WITH_LOCK(cs_work_queue, return m_interrupt || (m_work_queue.empty() && m_in_flight_task_count == 0));
+    }
+
+    void WaitUntilIdle() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    {
+        WAIT_LOCK(cs_work_queue, wait_lock);
+        while (!m_interrupt && (!m_work_queue.empty() || m_in_flight_task_count > 0)) {
+            m_wait_condition.wait(wait_lock);
+        }
+    }
+
+    void WaitForProgress() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    {
+        WAIT_LOCK(cs_work_queue, wait_lock);
+        if (!m_interrupt && (!m_work_queue.empty() || m_in_flight_task_count > 0)) {
+            m_wait_condition.wait(wait_lock);
+        }
     }
 
     size_t WorkersCount() const
