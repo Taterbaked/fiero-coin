@@ -19,7 +19,7 @@ std::list<CoinsCachePair> CreatePairs(CoinsCachePair& sentinel)
         nodes.emplace_back();
 
         auto node{std::prev(nodes.end())};
-        node->second.SetDirty(*node, sentinel);
+        CCoinsCacheEntry::SetDirty(*node, sentinel);
 
         BOOST_CHECK_EQUAL(node->second.GetFlags(), CCoinsCacheEntry::DIRTY);
         BOOST_CHECK_EQUAL(node->second.Next(), &sentinel);
@@ -147,7 +147,7 @@ BOOST_AUTO_TEST_CASE(linked_list_add_flags)
     CoinsCachePair n2;
 
     // Check that adding DIRTY flag inserts it into linked list and sets flags
-    n1.second.SetDirty(n1, sentinel);
+    CCoinsCacheEntry::SetDirty(n1, sentinel);
     BOOST_CHECK_EQUAL(n1.second.GetFlags(), CCoinsCacheEntry::DIRTY);
     BOOST_CHECK_EQUAL(n1.second.Next(), &sentinel);
     BOOST_CHECK_EQUAL(n1.second.Prev(), &sentinel);
@@ -155,7 +155,7 @@ BOOST_AUTO_TEST_CASE(linked_list_add_flags)
     BOOST_CHECK_EQUAL(sentinel.second.Prev(), &n1);
 
     // Check that adding FRESH flag on new node inserts it after n1
-    n2.second.SetFresh(n2, sentinel);
+    CCoinsCacheEntry::SetFresh(n2, sentinel);
     BOOST_CHECK_EQUAL(n2.second.GetFlags(), CCoinsCacheEntry::FRESH);
     BOOST_CHECK_EQUAL(n2.second.Next(), &sentinel);
     BOOST_CHECK_EQUAL(n2.second.Prev(), &n1);
@@ -163,7 +163,7 @@ BOOST_AUTO_TEST_CASE(linked_list_add_flags)
     BOOST_CHECK_EQUAL(sentinel.second.Prev(), &n2);
 
     // Check that we can add extra flags, but they don't change our position
-    n1.second.SetFresh(n1, sentinel);
+    CCoinsCacheEntry::SetFresh(n1, sentinel);
     BOOST_CHECK_EQUAL(n1.second.GetFlags(), CCoinsCacheEntry::DIRTY | CCoinsCacheEntry::FRESH);
     BOOST_CHECK_EQUAL(n1.second.Next(), &n2);
     BOOST_CHECK_EQUAL(n1.second.Prev(), &sentinel);
@@ -187,7 +187,7 @@ BOOST_AUTO_TEST_CASE(linked_list_add_flags)
     BOOST_CHECK_EQUAL(n2.second.Prev(), &sentinel);
 
     // Adding DIRTY re-inserts it after n2
-    n1.second.SetDirty(n1, sentinel);
+    CCoinsCacheEntry::SetDirty(n1, sentinel);
     BOOST_CHECK_EQUAL(n1.second.GetFlags(), CCoinsCacheEntry::DIRTY);
     BOOST_CHECK_EQUAL(n2.second.Next(), &n1);
     BOOST_CHECK_EQUAL(n1.second.Prev(), &n2);

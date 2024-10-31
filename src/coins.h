@@ -162,26 +162,19 @@ public:
     //! Adding a flag also requires a self reference to the pair that contains
     //! this entry in the CCoinsCache map and a reference to the sentinel of the
     //! flagged pair linked list.
-    inline void AddFlags(uint8_t flags, CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
+    static inline void AddFlags(uint8_t flags, CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
     {
         Assume(flags & (DIRTY | FRESH));
-        Assume(&self.second == this);
-        if (!m_flags) {
-            m_prev = sentinel.second.m_prev;
-            m_next = &sentinel;
+        if (!self.second.m_flags) {
+            self.second.m_prev = sentinel.second.m_prev;
+            self.second.m_next = &sentinel;
             sentinel.second.m_prev = &self;
-            m_prev->second.m_next = &self;
+            self.second.m_prev->second.m_next = &self;
         }
-        m_flags |= flags;
+        self.second.m_flags |= flags;
     }
-    inline void SetDirty(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
-    {
-        AddFlags(DIRTY, self, sentinel);
-    }
-    inline void SetFresh(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept
-    {
-        AddFlags(FRESH, self, sentinel);
-    }
+    static inline void SetDirty(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept { AddFlags(DIRTY, self, sentinel); }
+    static inline void SetFresh(CoinsCachePair& self, CoinsCachePair& sentinel) noexcept { AddFlags(FRESH, self, sentinel); }
     inline void SetClean() noexcept
     {
         if (!m_flags) return;
