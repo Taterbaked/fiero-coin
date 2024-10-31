@@ -166,6 +166,7 @@ public:
     {
         Assume(flags & (DIRTY | FRESH));
         if (!self.second.m_flags) {
+            Assume(self.second.m_prev == nullptr && self.second.m_next == nullptr);
             self.second.m_prev = sentinel.second.m_prev;
             self.second.m_next = &sentinel;
             sentinel.second.m_prev = &self;
@@ -181,6 +182,7 @@ public:
         m_next->second.m_prev = m_prev;
         m_prev->second.m_next = m_next;
         m_flags = 0;
+        m_prev = m_next = nullptr;
     }
     inline uint8_t GetFlags() const noexcept { return m_flags; }
     inline bool IsDirty() const noexcept { return m_flags & DIRTY; }
