@@ -425,7 +425,7 @@ class TestNode():
             f"Node returned unexpected exit code ({return_code}) vs ({expected_ret_code}) when stopping")
         # Check that stderr is as expected
         self.stderr.seek(0)
-        stderr = self.stderr.read().decode('utf-8').strip()
+        stderr = self.stderr.read().decode('utf-8').strip().replace('\r\n', '\n')
         if stderr != expected_stderr:
             raise AssertionError("Unexpected stderr {} != {}".format(stderr, expected_stderr))
 
@@ -671,7 +671,7 @@ class TestNode():
                 # Check stderr for expected message
                 if expected_msg is not None:
                     log_stderr.seek(0)
-                    stderr = log_stderr.read().decode('utf-8').strip()
+                    stderr = log_stderr.read().decode('utf-8').strip().replace('\r\n', '\n')
                     if match == ErrorMatch.PARTIAL_REGEX:
                         if re.search(expected_msg, stderr, flags=re.MULTILINE) is None:
                             self._raise_assertion_error(
