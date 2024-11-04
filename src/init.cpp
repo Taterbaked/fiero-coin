@@ -621,7 +621,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                    strprintf("Maximum tip age in seconds to consider node in initial block download (default: %u)",
                              Ticks<std::chrono::seconds>(DEFAULT_MAX_TIP_AGE)),
                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-printpriority", strprintf("Log transaction fee rate in " + CURRENCY_UNIT + "/kvB when mining blocks (default: %u)", DEFAULT_PRINT_MODIFIED_FEE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-printpriority", strprintf("Log transaction fee rate in %s/kvB when mining blocks (default: %u)", CURRENCY_UNIT, DEFAULT_PRINT_MODIFIED_FEE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-uacomment=<cmt>", "Append comment to the user agent string", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
 
     SetupChainParamsBaseOptions(argsman);
@@ -885,7 +885,7 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     }
     bilingual_str errors;
     for (const auto& arg : args.GetUnsuitableSectionOnlyArgs()) {
-        errors += strprintf(_("Config setting for %s only applied on %s network when in [%s] section.") + Untranslated("\n"), arg, ChainTypeToString(chain), ChainTypeToString(chain));
+        errors += strprintf(_("Config setting for %s only applied on %s network when in [%s] section."), arg, ChainTypeToString(chain), ChainTypeToString(chain)) + Untranslated("\n");
     }
 
     if (!errors.empty()) {
@@ -900,7 +900,7 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // Warn if unrecognized section name are present in the config file.
     bilingual_str warnings;
     for (const auto& section : args.GetUnrecognizedSections()) {
-        warnings += strprintf(Untranslated("%s:%i ") + _("Section [%s] is not recognized.") + Untranslated("\n"), section.m_file, section.m_line, section.m_name);
+        warnings += Untranslated(strprintf("%s:%i ", section.m_file, section.m_line)) + strprintf(_("Section [%s] is not recognized."), section.m_name) + Untranslated("\n");
     }
 
     if (!warnings.empty()) {
@@ -1207,7 +1207,7 @@ static ChainstateLoadResult InitAndLoadChainstate(
     try {
         node.chainman = std::make_unique<ChainstateManager>(*Assert(node.shutdown_signal), chainman_opts, blockman_opts);
     } catch (std::exception& e) {
-        return {ChainstateLoadStatus::FAILURE_FATAL, strprintf(Untranslated("Failed to initialize ChainstateManager: %s"), e.what())};
+        return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated(strprintf("Failed to initialize ChainstateManager: %s", e.what()))};
     }
     ChainstateManager& chainman = *node.chainman;
     // This is defined and set here instead of inline in validation.h to avoid a hard
@@ -1338,7 +1338,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             try {
                 ipc->listenAddress(address);
             } catch (const std::exception& e) {
-                return InitError(strprintf(Untranslated("Unable to bind to IPC address '%s'. %s"), address, e.what()));
+                return InitError(Untranslated(strprintf("Unable to bind to IPC address '%s'. %s", address, e.what())));
             }
             LogPrintf("Listening for IPC requests on address %s\n", address);
         }
@@ -2043,7 +2043,7 @@ bool StartIndexBackgroundSync(NodeContext& node)
         const CBlockIndex* start_block = *indexes_start_block;
         if (!start_block) start_block = chainman.ActiveChain().Genesis();
         if (!chainman.m_blockman.CheckBlockDataAvailability(*index_chain.Tip(), *Assert(start_block))) {
-            return InitError(strprintf(Untranslated("%s best block of the index goes beyond pruned data. Please disable the index or reindex (which will download the whole blockchain again)"), older_index_name));
+            return InitError(Untranslated(strprintf("%s best block of the index goes beyond pruned data. Please disable the index or reindex (which will download the whole blockchain again)", older_index_name)));
         }
     }
 
