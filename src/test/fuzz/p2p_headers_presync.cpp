@@ -1,3 +1,4 @@
+#include <arith_uint256.h>
 #include <blockencodings.h>
 #include <net.h>
 #include <net_processing.h>
@@ -90,9 +91,14 @@ CBlockHeader ConsumeHeader(FuzzedDataProvider& fuzzed_data_provider, const uint2
     CBlockHeader header;
     header.nNonce = 0;
     // Either use the previous difficulty or let the fuzzer choose
-    header.nBits = fuzzed_data_provider.ConsumeBool() ?
-                       prev_nbits :
-                       fuzzed_data_provider.ConsumeIntegralInRange<uint32_t>(0x17058EBE, 0x1D00FFFF);
+    if (fuzzed_data_provider.ConsumeBool()) {
+        header.nBits = prev_nbits;
+    } else {
+        arith_uint256 lower_target = UintToArith256(uint256{"000000000000000000058ebe0000000000000000000000000000000000000000"});
+        arith_uint256 upper_target = UintToArith256(uint256{"00000000ffff0000000000000000000000000000000000000000000000000000"});
+        arith_uint256 target = ConsumeArithUInt256InRange(fuzzed_data_provider, lower_target, upper_target);
+        header.nBits = target.GetCompact();
+    }
     header.nTime = ConsumeTime(fuzzed_data_provider);
     header.hashPrevBlock = prev_hash;
     header.nVersion = fuzzed_data_provider.ConsumeIntegral<int32_t>();
