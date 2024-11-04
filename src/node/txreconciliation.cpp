@@ -7,7 +7,9 @@
 #include <common/system.h>
 #include <logging.h>
 #include <util/check.h>
+#include <util/hasher.h>
 
+#include <cmath>
 #include <unordered_map>
 #include <variant>
 
@@ -17,6 +19,12 @@ namespace {
 /** Static salt component used to compute short txids for sketch construction, see BIP-330. */
 const std::string RECON_STATIC_SALT = "Tx Relay Salting";
 const HashWriter RECON_SALT_HASHER = TaggedHash(RECON_STATIC_SALT);
+/**
+ * Announce transactions via full wtxid to a limited number of inbound and outbound peers.
+ * Justification for these values are provided here:
+ * https://github.com/naumenkogs/txrelaysim/issues/7#issuecomment-902165806 */
+constexpr double INBOUND_FANOUT_DESTINATIONS_FRACTION = 0.1;
+constexpr size_t OUTBOUND_FANOUT_DESTINATIONS = 1;
 
 /**
  * Salt (specified by BIP-330) constructed from contributions from both peers. It is used
@@ -36,9 +44,6 @@ class TxReconciliationState
 {
 public:
     /**
-     * TODO: This field is public to ignore -Wunused-private-field. Make private once used in
-     * the following commits.
-     *
      * Reconciliation protocol assumes using one role consistently: either a reconciliation
      * initiator (requesting sketches), or responder (sending sketches). This defines our role,
      * based on the direction of the p2p connection.
@@ -47,14 +52,77 @@ public:
     bool m_we_initiate;
 
     /**
-     * TODO: These fields are public to ignore -Wunused-private-field. Make private once used in
-     * the following commits.
-     *
      * These values are used to salt short IDs, which is necessary for transaction reconciliations.
      */
     uint64_t m_k0, m_k1;
 
-    TxReconciliationState(bool we_initiate, uint64_t k0, uint64_t k1) : m_we_initiate(we_initiate), m_k0(k0), m_k1(k1) {}
+    /**
+    * Set of transactions to be added to the reconciliation set on the next trickle. These are still unrequestable for
+    * privacy reasons (to prevent transaction probing), transactions became available (moved to m_local_set) once they
+    * would have been announced via fanout.
+    */
+    std::unordered_set<Wtxid, SaltedTxidHasher> m_delayed_local_set;
+
+    /**
+     * Store all wtxids which we would announce to the peer (policy checks passed, etc.)
+     * in this set instead of announcing them right away. When reconciliation time comes, we will
+     * compute a compressed representation of this set ("sketch") and use it to efficiently
+     * reconcile this set with a set on the peer's side.
+     */
+    std::unordered_set<Wtxid, SaltedTxidHasher> m_local_set;
+
+    /**
+     * Reconciliation sketches are computed over short transaction IDs.
+     * This is a cache of these IDs enabling faster lookups of full wtxids,
+     * useful when peer will ask for missing transactions by short IDs
+     * at the end of a reconciliation round.
+     * We also use this to keep track of short ID collisions. In case of a
+     * collision, both transactions should be fanout.
+     */
+    std::map<uint32_t, Wtxid> m_short_id_mapping;
+
+    TxReconciliationState(bool we_initiate, uint64_t k0, uint64_t k1) : m_we_initiate(we_initiate), m_k0(k0), m_k1(k1), m_delayed_local_set(), m_local_set(0, m_delayed_local_set.hash_function()) {}
+
+    /**
+    * Checks whether a transaction is already in the set. If `include_delayed` is set, the delayed set is also
+    * checked. Otherwise, transactions are only looked up in the regular set.
+    */
+    bool ContainsTx(const Wtxid& wtxid, bool include_delayed)
+    {
+        bool found = m_local_set.find(wtxid) != m_local_set.end();
+        if (include_delayed) {
+            found |= m_delayed_local_set.find(wtxid) != m_delayed_local_set.end();
+        }
+
+        return found;
+    }
+
+    /**
+     * Computes the size of the reconciliation set (including both available and delayed transactions)
+     */
+    size_t ReconSetSize()
+    {
+        return m_local_set.size() + m_delayed_local_set.size();
+    }
+
+    bool RemoveFromSet(const Wtxid& wtxid)
+    {
+        auto r = m_local_set.erase(wtxid) + m_delayed_local_set.erase(wtxid);
+        // Data must be in one of the sets at most
+        Assume(r <= 1);
+        return r;
+    }
+
+    /**
+     * Reconciliation sketches are computed over short transaction IDs.
+     * Short IDs are salted with a link-specific constant value.
+     */
+    uint32_t ComputeShortID(const uint256 wtxid) const
+    {
+        const uint64_t s = SipHashUint256(m_k0, m_k1, wtxid);
+        const uint32_t short_txid = 1 + (s & 0xFFFFFFFF);
+        return short_txid;
+    }
 };
 
 } // namespace
@@ -76,17 +144,33 @@ private:
      */
     std::unordered_map<NodeId, std::variant<uint64_t, TxReconciliationState>> m_states GUARDED_BY(m_txreconciliation_mutex);
 
-public:
-    explicit Impl(uint32_t recon_version) : m_recon_version(recon_version) {}
+    /*
+     * Keeps track of how many of the registered peers are inbound. Updated on registering or
+     * forgetting peers.
+     */
+    size_t m_inbounds_count GUARDED_BY(m_txreconciliation_mutex){0};
 
-    uint64_t PreRegisterPeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    // Used for randomly choosing fanout targets.
+    CSipHasher m_deterministic_randomizer;
+
+    TxReconciliationState* GetRegisteredPeerState(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)
+    {
+        AssertLockHeld(m_txreconciliation_mutex);
+        auto salt_or_state = m_states.find(peer_id);
+        if (salt_or_state == m_states.end()) return nullptr;
+
+        return std::get_if<TxReconciliationState>(&salt_or_state->second);
+    }
+
+public:
+    explicit Impl(uint32_t recon_version, CSipHasher hasher) : m_recon_version(recon_version), m_deterministic_randomizer(std::move(hasher)) {}
+
+    uint64_t PreRegisterPeer(NodeId peer_id, uint64_t local_salt) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
     {
         AssertLockNotHeld(m_txreconciliation_mutex);
         LOCK(m_txreconciliation_mutex);
 
         LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Pre-register peer=%d\n", peer_id);
-        const uint64_t local_salt{FastRandomContext().rand64()};
-
         // We do this exactly once per peer (which are unique by NodeId, see GetNewNodeId) so it's
         // safe to assume we don't have this record yet.
         Assume(m_states.emplace(peer_id, local_salt).second);
@@ -121,19 +205,155 @@ public:
                       peer_id, is_peer_inbound);
 
         const uint256 full_salt{ComputeSalt(local_salt, remote_salt)};
-        recon_state->second = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1));
+
+        auto new_state = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1));;
+        m_states.erase(recon_state);
+        m_states.emplace(peer_id, std::move(new_state));
+
+        if (is_peer_inbound && m_inbounds_count < std::numeric_limits<size_t>::max()) {
+            ++m_inbounds_count;
+        }
         return ReconciliationRegisterResult::SUCCESS;
+    }
+
+    bool HasCollisionInternal(TxReconciliationState *peer_state, const Wtxid& wtxid, Wtxid& collision, uint32_t &short_id) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)
+    {
+        AssertLockHeld(m_txreconciliation_mutex);
+
+        short_id = peer_state->ComputeShortID(wtxid);
+        const auto iter = peer_state->m_short_id_mapping.find(short_id);
+
+        if (iter != peer_state->m_short_id_mapping.end()) {
+            collision = iter->second;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool HasCollision(NodeId peer_id, const Wtxid& wtxid, Wtxid& collision, uint32_t &short_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        const auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        return HasCollisionInternal(peer_state, wtxid, collision, short_id);
+    }
+
+    AddToSetResult AddToSet(NodeId peer_id, const Wtxid& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return AddToSetResult::Failed();
+
+        // Bypass if the wtxid is already in the set
+        if (peer_state->ContainsTx(wtxid, /*include_delayed=*/true)) {
+            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "%s already in reconciliation set for peer=%d. Bypassing.\n",
+                          wtxid.ToString(), peer_id);
+            return AddToSetResult::Succeeded();
+        }
+
+        // Make sure there is no short id collision between the wtxid we are trying to add
+        // and any existing one in the reconciliation set
+        Wtxid collision;
+        uint32_t short_id;
+        if (HasCollisionInternal(peer_state, wtxid, collision, short_id)) {
+            return AddToSetResult::Collision(collision);
+        }
+
+        // Check if the reconciliation set is not at capacity for two reasons:
+        // - limit sizes of reconciliation sets and short id mappings;
+        // - limit CPU use for sketch computations.
+        //
+        // Since we reconcile frequently, reaching capacity either means:
+        // (1) a peer for some reason does not request reconciliations from us for a long while, or
+        // (2) really a lot of valid fee-paying transactions were dumped on us at once.
+        // We don't care about a laggy peer (1) because we probably can't help them even if we fanout transactions.
+        // However, exploiting (2) should not prevent us from relaying certain transactions.
+        //
+        // Transactions which don't make it to the set due to the limit are announced via fan-out.
+        auto set_size = peer_state->ReconSetSize();
+        if (set_size >= MAX_RECONSET_SIZE) return AddToSetResult::Failed();
+
+        // The caller currently keeps track of the per-peer transaction announcements, so it
+        // should not attempt to add same tx to the set twice. However, if that happens, we will
+        // simply ignore it.
+        if (peer_state->m_delayed_local_set.insert(wtxid).second) {
+            peer_state->m_short_id_mapping.emplace(short_id, wtxid);
+            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Added %s to the reconciliation set for peer=%d. "
+                                                                        "Now the set contains %i transactions.\n",
+                          wtxid.ToString(), peer_id, set_size + 1);
+        }
+        return AddToSetResult::Succeeded();
+    }
+
+    bool ReadyDelayedTransactions(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        peer_state->m_local_set.merge(peer_state->m_delayed_local_set);
+        // There should be no duplicates, so m_delayed_local_set should be emptied
+        Assert(peer_state->m_delayed_local_set.empty());
+        return true;
+    }
+
+    bool IsTransactionInSet(NodeId peer_id, const Wtxid& wtxid, bool include_delayed) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        return peer_state->ContainsTx(wtxid, include_delayed);
+    }
+
+    bool TryRemovingFromSet(NodeId peer_id, const Wtxid& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return false;
+
+        auto removed = peer_state->RemoveFromSet(wtxid);
+        if (removed) {
+            peer_state->m_short_id_mapping.erase(peer_state->ComputeShortID(wtxid));
+            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Removed %s from the reconciliation set for peer=%d. "
+                                                                        "Now the set contains %i transactions.\n",
+                          wtxid.ToString(), peer_id, peer_state->ReconSetSize());
+        } else {
+            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Couldn't remove %s from the reconciliation set for peer=%d. "
+                                                                        "Transaction not found\n",
+                          wtxid.ToString(), peer_id);
+        }
+
+        return removed;
     }
 
     void ForgetPeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
     {
         AssertLockNotHeld(m_txreconciliation_mutex);
         LOCK(m_txreconciliation_mutex);
-        if (m_states.erase(peer_id)) {
-            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Forget txreconciliation state of peer=%d\n", peer_id);
+        const auto peer = m_states.find(peer_id);
+        if (peer == m_states.end()) return;
+
+        const auto registered = std::get_if<TxReconciliationState>(&peer->second);
+        if (registered && !registered->m_we_initiate) {
+            Assert(m_inbounds_count > 0);
+            --m_inbounds_count;
         }
+
+        m_states.erase(peer);
+        LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Forget txreconciliation state of peer=%d\n", peer_id);
     }
 
+    /**
+     * For calls within this class use GetRegisteredPeerState instead.
+     */
     bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
     {
         AssertLockNotHeld(m_txreconciliation_mutex);
@@ -142,21 +362,181 @@ public:
         return (recon_state != m_states.end() &&
                 std::holds_alternative<TxReconciliationState>(recon_state->second));
     }
+
+    std::vector<NodeId> GetFanoutTargets(const Wtxid& wtxid, size_t inbounds_fanout_tx_relay, size_t outbounds_fanout_tx_relay) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+
+        // We decide whether a particular peer is a low-fanout flood target differently based on its connection direction:
+        // - for outbounds we have a fixed number of flood destinations.
+        // - for inbounds we use a fraction of all inbound peers supporting tx relay.
+        size_t outbounds_target_size = 0;
+        if (OUTBOUND_FANOUT_DESTINATIONS > outbounds_fanout_tx_relay) {
+            outbounds_target_size = OUTBOUND_FANOUT_DESTINATIONS - outbounds_fanout_tx_relay;
+        }
+
+        // Since we use the fraction for inbound peers, we first need to compute the total number of inbound targets.
+        const double inbound_targets = (inbounds_fanout_tx_relay + m_inbounds_count) * INBOUND_FANOUT_DESTINATIONS_FRACTION;
+        double n = std::max(inbound_targets - inbounds_fanout_tx_relay, 0.0);
+
+        // Being this a fraction, we need to round it either up or down. We do this deterministically at random based on the
+        // transaction we are picking the peers for.
+        CSipHasher deterministic_randomizer_in{m_deterministic_randomizer};
+        deterministic_randomizer_in.Write(wtxid.ToUint256());
+        CSipHasher deterministic_randomizer_out{deterministic_randomizer_in};
+        const size_t inbounds_target_size = ((deterministic_randomizer_in.Finalize() & 0xFFFFFFFF) + uint64_t(n * 0x100000000)) >> 32;
+
+        // Pick all reconciliation registered peers and assign them a deterministically random value based on their peer id
+        // Also, split peers in inbounds/outbounds
+        std::vector<std::pair<uint64_t, NodeId>> sorted_inbounds, sorted_outbounds;
+        sorted_inbounds.reserve(m_inbounds_count);
+        Assume(m_states.size() >= m_inbounds_count);
+        sorted_outbounds.reserve(m_states.size() - m_inbounds_count);
+        for (const auto& [node_id, op_peer_state]: m_states) {
+            const auto peer_state = std::get_if<TxReconciliationState>(&op_peer_state);
+            if (peer_state) {
+                if (peer_state->m_we_initiate) {
+                    uint64_t hash_key = CSipHasher(deterministic_randomizer_out).Write(node_id).Finalize();
+                    sorted_outbounds.emplace_back(hash_key, node_id);
+                } else {
+                    uint64_t hash_key = CSipHasher(deterministic_randomizer_in).Write(node_id).Finalize();
+                    sorted_inbounds.emplace_back(hash_key, node_id);
+                }
+
+            }
+        }
+
+        // Sort the peers based on their assigned random value, extract the node_ids and trim the collections to size
+        std::vector<NodeId> in_fanout_targets;
+        if (inbounds_target_size >= 1) {
+            std::sort(sorted_inbounds.begin(), sorted_inbounds.end());
+            for_each(sorted_inbounds.begin(), sorted_inbounds.end(),
+                    [&in_fanout_targets](auto& keyed_peer) { in_fanout_targets.push_back(keyed_peer.second); });
+            in_fanout_targets.resize(inbounds_target_size);
+        }
+        std::vector<NodeId> out_fanout_targets;
+        if (outbounds_target_size >= 1) {
+            std::sort(sorted_outbounds.begin(), sorted_outbounds.end());
+            for_each(sorted_outbounds.begin(), sorted_outbounds.end(),
+                    [&out_fanout_targets](auto& keyed_peer) { out_fanout_targets.push_back(keyed_peer.second); });
+            out_fanout_targets.resize(outbounds_target_size);
+        }
+
+        // Merge both vectors and return
+        in_fanout_targets.insert(in_fanout_targets.end(), out_fanout_targets.begin(), out_fanout_targets.end());
+
+        return in_fanout_targets;
+    }
+
+    bool ShouldFanoutTo(NodeId peer_id, std::vector<NodeId> &fanout_targets) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+        auto peer_state = GetRegisteredPeerState(peer_id);
+        if (!peer_state) return true;
+
+        return std::find(fanout_targets.begin(), fanout_targets.end(), peer_id) != fanout_targets.end();
+    }
+
+    std::vector<NodeId> SortPeersByFewestParents(std::vector<Wtxid> parents) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+
+        std::vector<std::pair<uint16_t, NodeId>> parents_by_peer{};
+        for (const auto &[peer_id, _]: m_states) {
+            if (GetRegisteredPeerState(peer_id)) {
+                parents_by_peer.emplace_back(0, peer_id);
+            }
+        }
+
+
+        for (auto &[parent_count, peer_id]: parents_by_peer) {
+            auto state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);
+            for (const auto& wtxid: parents) {
+                if (state.ContainsTx(wtxid, /*include_delayed=*/true)) {
+                    ++parent_count;
+                }
+            }
+        }
+
+        std::sort(parents_by_peer.begin(), parents_by_peer.end());
+        std::vector<NodeId> sorted_peers;
+        sorted_peers.reserve(parents_by_peer.size());
+        for (const auto &[_, node_id]: parents_by_peer) {
+            sorted_peers.emplace_back(node_id);
+        }
+
+        return sorted_peers;
+    }
 };
 
-TxReconciliationTracker::TxReconciliationTracker(uint32_t recon_version) : m_impl{std::make_unique<TxReconciliationTracker::Impl>(recon_version)} {}
+AddToSetResult::AddToSetResult(bool succeeded, std::optional<Wtxid> conflict)
+{
+    m_succeeded = succeeded;
+    m_conflict = conflict;
+}
+
+AddToSetResult AddToSetResult::Succeeded()
+{
+    return AddToSetResult(true, std::nullopt);
+}
+
+AddToSetResult AddToSetResult::Failed()
+{
+    return AddToSetResult(false, std::nullopt);
+}
+
+AddToSetResult AddToSetResult::Collision(Wtxid wtxid)
+{
+    return AddToSetResult(false, std::make_optional(wtxid));
+}
+
+TxReconciliationTracker::TxReconciliationTracker(uint32_t recon_version, CSipHasher hasher) : m_impl{std::make_unique<TxReconciliationTracker::Impl>(recon_version, hasher)} {}
 
 TxReconciliationTracker::~TxReconciliationTracker() = default;
 
 uint64_t TxReconciliationTracker::PreRegisterPeer(NodeId peer_id)
 {
-    return m_impl->PreRegisterPeer(peer_id);
+    const uint64_t local_salt{FastRandomContext().rand64()};
+    return m_impl->PreRegisterPeer(peer_id, local_salt);
+}
+
+void TxReconciliationTracker::PreRegisterPeerWithSalt(NodeId peer_id, uint64_t local_salt)
+{
+    m_impl->PreRegisterPeer(peer_id, local_salt);
 }
 
 ReconciliationRegisterResult TxReconciliationTracker::RegisterPeer(NodeId peer_id, bool is_peer_inbound,
                                                           uint32_t peer_recon_version, uint64_t remote_salt)
 {
     return m_impl->RegisterPeer(peer_id, is_peer_inbound, peer_recon_version, remote_salt);
+}
+
+bool TxReconciliationTracker::HasCollision(NodeId peer_id, const Wtxid& wtxid, Wtxid& collision, uint32_t &short_id)
+{
+    return m_impl->HasCollision(peer_id, wtxid, collision, short_id);
+}
+
+AddToSetResult TxReconciliationTracker::AddToSet(NodeId peer_id, const Wtxid& wtxid)
+{
+    return m_impl->AddToSet(peer_id, wtxid);
+}
+
+bool TxReconciliationTracker::ReadyDelayedTransactions(NodeId peer_id)
+{
+    return m_impl->ReadyDelayedTransactions(peer_id);
+}
+
+bool TxReconciliationTracker::IsTransactionInSet(NodeId peer_id, const Wtxid& wtxid, bool include_delayed)
+{
+    return m_impl->IsTransactionInSet(peer_id, wtxid, include_delayed);
+}
+
+bool TxReconciliationTracker::TryRemovingFromSet(NodeId peer_id, const Wtxid& wtxid)
+{
+    return m_impl->TryRemovingFromSet(peer_id, wtxid);
 }
 
 void TxReconciliationTracker::ForgetPeer(NodeId peer_id)
@@ -167,4 +547,19 @@ void TxReconciliationTracker::ForgetPeer(NodeId peer_id)
 bool TxReconciliationTracker::IsPeerRegistered(NodeId peer_id) const
 {
     return m_impl->IsPeerRegistered(peer_id);
+}
+
+std::vector<NodeId> TxReconciliationTracker::GetFanoutTargets(const Wtxid& wtxid, size_t inbounds_fanout_tx_relay, size_t outbounds_fanout_tx_relay)
+{
+    return m_impl->GetFanoutTargets(wtxid, inbounds_fanout_tx_relay, outbounds_fanout_tx_relay);
+}
+
+bool TxReconciliationTracker::ShouldFanoutTo(NodeId peer_id, std::vector<NodeId> &fanout_targets)
+{
+    return m_impl->ShouldFanoutTo(peer_id, fanout_targets);
+}
+
+std::vector<NodeId> TxReconciliationTracker::SortPeersByFewestParents(std::vector<Wtxid> parents)
+{
+    return m_impl->SortPeersByFewestParents(parents);
 }
