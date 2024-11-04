@@ -13,6 +13,7 @@
 #include <consensus/amount.h>
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
+#include <inputfetcher.h>
 #include <kernel/chain.h>
 #include <kernel/chainparams.h>
 #include <kernel/chainstatemanager_opts.h>
@@ -31,6 +32,7 @@
 #include <util/fs.h>
 #include <util/hasher.h>
 #include <util/result.h>
+#include <util/threadpool.h>
 #include <util/translation.h>
 #include <versionbits.h>
 
@@ -946,8 +948,10 @@ private:
         return cs && !cs->m_disabled;
     }
 
+    std::shared_ptr<ThreadPool> m_thread_pool;
     //! A queue for script verifications that have to be performed by worker threads.
     CCheckQueue<CScriptCheck> m_script_check_queue;
+    InputFetcher m_input_fetcher;
 
     //! Timers and counters used for benchmarking validation in both background
     //! and active chainstates.
@@ -1315,6 +1319,7 @@ public:
     std::optional<int> GetSnapshotBaseHeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     CCheckQueue<CScriptCheck>& GetCheckQueue() { return m_script_check_queue; }
+    InputFetcher& GetInputFetcher() { return m_input_fetcher; }
 
     ~ChainstateManager();
 };

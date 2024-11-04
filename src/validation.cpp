@@ -3162,6 +3162,11 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     LogDebug(BCLog::BENCH, "  - Load block from disk: %.2fms\n",
              Ticks<MillisecondsDouble>(time_2 - time_1));
     {
+        auto& input_fetcher{m_chainman.GetInputFetcher()};
+        if (input_fetcher.HasThreads()) {
+           input_fetcher.FetchInputs(CoinsTip(), CoinsDB(), blockConnecting);
+        }
+
         CCoinsViewCache view(&CoinsTip());
         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view);
         if (m_chainman.m_options.signals) {
@@ -6250,12 +6255,17 @@ static ChainstateManager::Options&& Flatten(ChainstateManager::Options&& opts)
 }
 
 ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Options options, node::BlockManager::Options blockman_options)
-    : m_script_check_queue{/*batch_size=*/128, options.worker_threads_num},
+    : m_thread_pool(std::make_shared<ThreadPool>()),
+      m_script_check_queue{/*batch_size=*/128, m_thread_pool},
+      m_input_fetcher{/*batch_size=*/128, m_thread_pool},
       m_interrupt{interrupt},
       m_options{Flatten(std::move(options))},
       m_blockman{interrupt, std::move(blockman_options)},
       m_validation_cache{m_options.script_execution_cache_bytes, m_options.signature_cache_bytes}
 {
+    if (m_options.worker_threads_num > 0) {
+        m_thread_pool->Start(m_options.worker_threads_num);
+    }
 }
 
 ChainstateManager::~ChainstateManager()

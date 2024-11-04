@@ -29,6 +29,7 @@
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/transaction_identifier.h>
+#include <util/threadpool.h>
 #include <validation.h>
 
 #include <functional>
@@ -567,7 +568,9 @@ BOOST_AUTO_TEST_CASE(test_big_witness_transaction)
 
     // check all inputs concurrently, with the cache
     PrecomputedTransactionData txdata(tx);
-    CCheckQueue<CScriptCheck> scriptcheckqueue(/*batch_size=*/128, /*worker_threads_num=*/20);
+    auto thread_pool{std::make_shared<ThreadPool>()};
+    thread_pool->Start(20);
+    CCheckQueue<CScriptCheck> scriptcheckqueue(/*batch_size=*/128, thread_pool);
     CCheckQueueControl<CScriptCheck> control(&scriptcheckqueue);
 
     std::vector<Coin> coins;
